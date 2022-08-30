@@ -5,7 +5,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from PIL import ImageDraw, ImageFont
+from PIL import ImageDraw, ImageFont, Image
 
 from nets.yolo import YoloBody
 from utils.utils import (cvtColor, get_anchors, get_classes, preprocess_input,
@@ -417,7 +417,158 @@ class YOLO(object):
                 continue
 
             f.write("%s %s %s %s %s %s\n" % (
-            predicted_class, score[:6], str(int(left)), str(int(top)), str(int(right)), str(int(bottom))))
+                predicted_class, score[:6], str(int(left)), str(int(top)), str(int(right)), str(int(bottom))))
 
         f.close()
         return
+
+    def get_results(self, image_id):
+        image_path = os.path.join('data/BMPImage', '%s.bmp' % image_id)
+        # 预处理
+        image = Image.open(image_path)
+        image_shape = np.array(np.shape(image)[0:2])
+        image = cvtColor(image)
+        image_data = resize_image(image, (self.input_shape[1], self.input_shape[0]), self.letterbox_image)
+        image_data = np.expand_dims(
+            np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
+
+        with torch.no_grad():
+            images = torch.from_numpy(image_data)
+            if self.cuda:
+                images = images.cuda()
+            outputs = self.net(images)
+            outputs = self.bbox_util.decode_box(outputs)
+            # ---------------------------------------------------------#
+            #   将预测框进行堆叠，然后进行非极大抑制
+            # ---------------------------------------------------------#
+            results = self.bbox_util.non_max_suppression(torch.cat(outputs, 1), self.num_classes, self.input_shape,
+                                                         image_shape, self.letterbox_image, conf_thres=self.confidence,
+                                                         nms_thres=self.nms_iou)
+        if results[0] is None:
+            return
+
+        label = results[0][:, 6]  # class index
+        conf = results[0][:, 4] * results[0][:, 5]  # score
+        boxes = results[0][:, [1, 0, 3, 2]]  # y1,x1,y2,x2
+
+        return torch.from_numpy(label), torch.from_numpy(conf), torch.from_numpy(boxes)
+
+    def get_fusemap_txt(self, images_id, classes_name, results_pt):
+        label_0, conf_0, boxes_0 = self.get_results(images_id[0])
+        count_0 = torch.ones(len(boxes_0))  # 上一个角度计数情况，这里初始化为第1个视角的计数
+        label_9, conf_9, boxes_9 = self.get_results(images_id[8])
+        count_9 = torch.ones(len(boxes_9))  # 第9个视角的计数情况
+        for i in range(1, 5):
+            label_next, conf_next, boxes_next = self.get_results(images_id[i])
+            pair_iou = bboxes_iou(boxes_0, boxes_next)  # 计算前一个角度和后一个角度预测框的iou情况
+            if pair_iou.shape[1] == 0:  # 如果下一个角度没有预测框,直接跳过到下一个角度
+                continue
+            pair_iou_mask = ~ (torch.sum(pair_iou > 0, dim=1).bool())
+            # 0     0.5    0        0     0.5   0       0       0       0
+            # 0.5   0      0.5  ->  0.5   0     0 ->    0.5     0       0
+            # 0     0.4    0        0     0.4   0       0       0.4     0
+            # 横向找最大，纵向找最多。
+            ious, indices = torch.max(pair_iou, dim=1)  # indices 当前框加到下一个角度框的索引
+            pair_iou_copy = torch.zeros((len(boxes_0), len(boxes_next)))
+            pair_iou_copy[range(len(boxes_0)), indices] = ious  # 此时已经保证每一行至多一个数不为0
+            for i in range(len(boxes_next)):
+                non_zero_idx = torch.nonzero(pair_iou_copy[:, i])
+                if len(non_zero_idx) < 2:
+                    continue
+                _, indice = torch.max(count_0[non_zero_idx], dim=0)  # 判断哪个框的数量较多
+                max_indice = non_zero_idx[indice]  # 得到数量最大的前一个框
+                pair_iou_copy[:, i] = 0
+                pair_iou_copy[max_indice, i] = 1
+            ious, indices = torch.max(pair_iou_copy, dim=1)
+            mask = ious.bool()  # 如果最大值Iou是0,那么该框不添加到下一个框,那么问题来了。前面的框不算了嘛
+
+            boxes_0 = torch.cat((boxes_next, boxes_0[pair_iou_mask]), dim=0)
+            conf_0 = torch.cat((conf_next, conf_0[pair_iou_mask]), dim=0)
+            label_0 = torch.cat((label_next, label_0[pair_iou_mask]), dim=0)
+
+            count_next = torch.ones(len(boxes_next))
+            count_next = torch.cat((count_next, count_0[pair_iou_mask]))  # 将没有重叠框的计数 cat到下一个角度。
+            count_next[indices[mask]] += count_0[mask]
+            count_0 = count_next
+
+        for j in range(7, 4, -1):
+            label_last, conf_last, boxes_last = self.get_results(images_id[j])
+            pair_iou = bboxes_iou(boxes_9, boxes_last)  # 计算前一个角度和后一个角度预测框的iou情况
+            pair_iou_mask = ~ (torch.sum(pair_iou > 0, dim=1).bool())
+            if pair_iou.shape[1] == 0:  # 说明下一个角度没有框
+                continue
+
+            ious, indices = torch.max(pair_iou, dim=1)  # 170的时候pair_iou的Shape为(1,0) 所以无法在dim=1上进行Iou的计算
+            pair_iou_copy = torch.zeros((len(boxes_9), len(boxes_last)))
+            pair_iou_copy[range(len(boxes_9)), indices] = ious  # 此时已经保证每一行至多一个数不为0
+            for i in range(len(boxes_last)):
+                non_zero_idx = torch.nonzero(pair_iou_copy[:, i])
+                if len(non_zero_idx) < 2:
+                    continue
+                _, indice = torch.max(count_9[non_zero_idx], dim=0)  # 判断哪个框的数量较多
+                max_indice = non_zero_idx[indice]  # 得到数量最大的前一个框
+                pair_iou_copy[:, i] = 0
+                pair_iou_copy[max_indice, i] = 1
+            ious, indices = torch.max(pair_iou_copy, dim=1)
+            mask = ious.bool()
+
+            boxes_9 = torch.cat((boxes_last, boxes_9[pair_iou_mask]), dim=0)
+            conf_9 = torch.cat((conf_last, conf_9[pair_iou_mask]), dim=0)
+            label_9 = torch.cat((label_last, label_9[pair_iou_mask]), dim=0)
+
+            count_last = torch.ones(len(boxes_last))
+            count_last = torch.cat((count_last, count_9[pair_iou_mask]))
+            count_last[indices[mask]] += count_9[mask]
+            count_9 = count_last
+
+        pair_iou = bboxes_iou(boxes_9, boxes_0)
+        pair_iou_mask = ~ (torch.sum(pair_iou > 0, dim=1).bool())
+
+        ious, indices = torch.max(pair_iou, dim=1)
+        pair_iou_copy = torch.zeros((len(boxes_9), len(boxes_0)))
+        pair_iou_copy[range(len(boxes_9)), indices] = ious  # 此时已经保证每一行至多一个数不为0
+        for i in range(len(boxes_0)):
+            non_zero_idx = torch.nonzero(pair_iou_copy[:, i])
+            if len(non_zero_idx) < 2:
+                continue
+            _, indice = torch.max(count_9[non_zero_idx], dim=0)  # 判断哪个框的数量较多
+            max_indice = non_zero_idx[indice]  # 得到数量最大的前一个框
+            pair_iou_copy[:, i] = 0
+            pair_iou_copy[max_indice, i] = 1
+        ious, indices = torch.max(pair_iou_copy, dim=1)
+        mask = ious.bool()
+
+        boxes = torch.cat((boxes_0, boxes_9[pair_iou_mask]), dim=0).int()
+        labels = torch.cat((label_0, label_9[pair_iou_mask]), dim=0)
+        conf = torch.cat((conf_0, conf_9[pair_iou_mask]), dim=0)
+
+        count = torch.cat((count_0, count_9[pair_iou_mask]))
+        count[indices[mask]] += count_9[mask]
+        # 进行过滤预测框
+        # count_mask = (count > 1) & (count > 2) | (conf > 0.7)
+        count_mask = count > 1
+        boxes = boxes[count_mask]
+        labels = labels[count_mask]
+        conf = conf[count_mask]
+        # print(count)
+
+        with open(os.path.join(results_pt, "detection-results/" + images_id[4] + ".txt"), "w") as new_f:
+            for m, box in enumerate(boxes):
+                # boxes : ymin,xmin,ymax,xmax
+                new_f.write(
+                    "%s %s %s %s %s %s\n" % (
+                        classes_name[int(labels[m])], str(float("%.4f" % conf[m])), str(int(box[0])), str(int(box[1])),
+                        str(int(box[2])),
+                        str(int(box[3]))))
+
+
+def bboxes_iou(bboxes_a, bboxes_b):  # 计算pair_iou
+    bboxes_a = torch.tensor(bboxes_a)
+    bboxes_b = torch.tensor(bboxes_b)
+    tl = torch.max(bboxes_a[:, None, :2], bboxes_b[:, :2])  # [num_a,num_b,2]返回两两之间xmin和ymin较大的值
+    br = torch.min(bboxes_a[:, None, 2:], bboxes_b[:, 2:])  # [num_a,num_b,2]返回两两之间xmax和ymax较大的值
+    area_a = torch.prod(bboxes_a[:, 2:] - bboxes_a[:, :2], 1)  # 得到bboxes_a 所有框的面积
+    area_b = torch.prod(bboxes_b[:, 2:] - bboxes_b[:, :2], 1)  # 得到bboxes_b 所有框的面积
+    en = (tl < br).type(tl.type()).prod(dim=2)  # [num_a,num_b] 判断两个gt框是否相交,如果没有相交,要将相交面积置0，不然可能会出现负数，或者负数和负数相乘的情况
+    area_i = torch.prod(br - tl, 2) * en  # [num_a,num_b]两两之间的相交区域
+    return area_i / (area_a[:, None] + area_b - area_i)  # 得到两两之间的Iou
